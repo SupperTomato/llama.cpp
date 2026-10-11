@@ -1351,20 +1351,73 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
     }
 }
 
+// Operit patch: the session votes max clocks with sleep disabled for its whole lifetime, so an
+// idle app kept the cDSP at its top corners. After HTP_IDLE_POWER_US without work, hand the clocks
+// back to DCVS and allow low-power modes; restore the full vote when the next batch arrives.
+#define HTP_IDLE_POWER_US 2000000
+
+static void htp_power_vote(struct htp_context * ctx, bool active) {
+    HAP_power_request_t request;
+    memset(&request, 0, sizeof(request));
+    request.type                              = HAP_power_set_DCVS_v3;
+    request.dcvs_v3.set_dcvs_enable           = TRUE;
+    request.dcvs_v3.dcvs_enable               = active ? FALSE : TRUE;
+    request.dcvs_v3.set_bus_params            = TRUE;
+    request.dcvs_v3.bus_params.min_corner     = active ? HAP_DCVS_VCORNER_MAX : HAP_DCVS_VCORNER_DISABLE;
+    request.dcvs_v3.bus_params.max_corner     = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.bus_params.target_corner  = active ? HAP_DCVS_VCORNER_MAX : HAP_DCVS_VCORNER_DISABLE;
+    request.dcvs_v3.set_core_params           = TRUE;
+    request.dcvs_v3.core_params.min_corner    = active ? HAP_DCVS_VCORNER_MAX : HAP_DCVS_VCORNER_DISABLE;
+    request.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.core_params.target_corner = active ? HAP_DCVS_VCORNER_MAX : HAP_DCVS_VCORNER_DISABLE;
+    request.dcvs_v3.set_sleep_disable         = TRUE;
+    request.dcvs_v3.sleep_disable             = active ? HAP_DCVS_LPM_LEVEL1 : HAP_DCVS_LPM_ENABLE_ALL;
+#if (__HEXAGON_ARCH__ >= 79)
+    HAP_set_dcvs_v3_protected_bus_corners(&request, active ? 1 : 0);
+#endif
+    int err = HAP_power_set((void *) ctx, &request);
+
+#if __HVX_ARCH__ >= 75
+    memset(&request, 0, sizeof(request));
+    request.type                 = HAP_power_set_HMX_v2;
+    request.hmx_v2.set_power     = TRUE;
+    request.hmx_v2.power_up      = TRUE;
+    request.hmx_v2.set_clock     = TRUE;
+    request.hmx_v2.target_corner = active ? HAP_DCVS_EXP_VCORNER_MAX : HAP_DCVS_EXP_VCORNER_MIN;
+    request.hmx_v2.min_corner    = active ? HAP_DCVS_EXP_VCORNER_MAX : HAP_DCVS_EXP_VCORNER_MIN;
+    request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
+    request.hmx_v2.perf_mode     = active ? HAP_CLK_PERF_HIGH : HAP_CLK_PERF_LOW;
+    err |= HAP_power_set((void *) ctx, &request);
+#endif
+    FARF(HIGH, "ggml-hex: power vote %s (err 0x%x)", active ? "active" : "idle", (unsigned) err);
+}
+
 static void htp_main_thread(void * context) {
     struct htp_context * ctx = (struct htp_context *) context;
 
     FARF(HIGH, "htp-main-thread: started");
+
+    bool     idle    = false;
+    uint64_t last_us = HAP_perf_get_time_us();
 
     while (!atomic_load(&ctx->killed)) {
         uint32_t flags = 0;
         uint32_t num_buffers = 0;
         uint32_t message_length = 0;
 
-        int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
+        int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, idle ? 1000000 : 50000);
         if (err == 0) {
+            if (idle) {
+                htp_power_vote(ctx, true);
+                idle = false;
+            }
             process_ops(ctx);
+            last_us = HAP_perf_get_time_us();
         } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED) {
+            if (!idle && HAP_perf_get_time_us() - last_us > HTP_IDLE_POWER_US) {
+                htp_power_vote(ctx, false);
+                idle = true;
+            }
             continue;
         } else {
             FARF(ERROR, "dspqueue_peek failed: 0x%08x", (unsigned) err);

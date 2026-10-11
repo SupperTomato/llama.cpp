@@ -328,6 +328,113 @@ static std::string get_driver_path() {
 
 using dl_handle_ptr = std::unique_ptr<dl_handle, dl_handle_deleter>;
 
+#if defined(__ANDROID__)
+#include <android/dlext.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstring>
+
+// dlsym() cannot see the dynamic linker's own exports from an app namespace,
+// so look the symbol up in linker64's .dynsym and rebase it by its load address.
+static void * htp_find_linker_symbol(const char * symbol) {
+    FILE * maps = fopen("/proc/self/maps", "re");
+    if (maps == nullptr) {
+        return nullptr;
+    }
+    char line[512];
+    uintptr_t base = 0;
+    char path[256] = {};
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0, offset = 0;
+        char perms[8] = {}, file[256] = {};
+        if (sscanf(line, "%lx-%*lx %7s %lx %*s %*s %255s", &start, perms, &offset, file) == 4 &&
+            offset == 0 && strstr(file, "/linker64") != nullptr) {
+            base = start;
+            strncpy(path, file, sizeof(path) - 1);
+            break;
+        }
+    }
+    fclose(maps);
+    if (base == 0) {
+        return nullptr;
+    }
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return nullptr;
+    }
+    struct stat st {};
+    void * map = fstat(fd, &st) == 0 ? mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (map == MAP_FAILED) {
+        return nullptr;
+    }
+
+    void * result = nullptr;
+    const auto * bytes = static_cast<const uint8_t *>(map);
+    const auto * eh    = reinterpret_cast<const Elf64_Ehdr *>(bytes);
+    const auto * sh    = reinterpret_cast<const Elf64_Shdr *>(bytes + eh->e_shoff);
+    const auto * ph    = reinterpret_cast<const Elf64_Phdr *>(bytes + eh->e_phoff);
+    uintptr_t min_vaddr = UINTPTR_MAX;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < min_vaddr) {
+            min_vaddr = ph[i].p_vaddr & ~static_cast<uintptr_t>(0xfff);
+        }
+    }
+    for (int i = 0; i < eh->e_shnum && result == nullptr; i++) {
+        if (sh[i].sh_type != SHT_DYNSYM && sh[i].sh_type != SHT_SYMTAB) {
+            continue;
+        }
+        const auto * syms  = reinterpret_cast<const Elf64_Sym *>(bytes + sh[i].sh_offset);
+        const char * strs  = reinterpret_cast<const char *>(bytes + sh[sh[i].sh_link].sh_offset);
+        const size_t count = sh[i].sh_size / sizeof(Elf64_Sym);
+        for (size_t j = 0; j < count; j++) {
+            if (syms[j].st_value != 0 && strcmp(strs + syms[j].st_name, symbol) == 0) {
+                result = reinterpret_cast<void *>(base + syms[j].st_value - min_vaddr);
+                break;
+            }
+        }
+    }
+    munmap(map, st.st_size);
+    return result;
+}
+// Apps targeting API 31+ can only dlopen vendor public libraries (libcdsprpc.so)
+// that they declare via <uses-native-library>. Fall back to the exported "sphal"
+// vendor namespace, which is how GPU drivers are loaded into app processes.
+static dl_handle * htp_load_vendor_library(const char * name) {
+    using get_ns_fn = struct android_namespace_t * (*)(const char *);
+    get_ns_fn get_ns = (get_ns_fn) dlsym(RTLD_DEFAULT, "android_get_exported_namespace");
+    if (get_ns == nullptr) {
+        get_ns = (get_ns_fn) htp_find_linker_symbol("__loader_android_get_exported_namespace");
+    }
+    if (get_ns == nullptr) {
+        GGML_LOG_ERROR("ggml-hex: android_get_exported_namespace unavailable\n");
+        return nullptr;
+    }
+    for (const char * ns_name : { "sphal", "vendor", "default" }) {
+        struct android_namespace_t * ns = get_ns(ns_name);
+        if (ns == nullptr) {
+            continue;
+        }
+        android_dlextinfo info = {};
+        info.flags             = ANDROID_DLEXT_USE_NAMESPACE;
+        info.library_namespace = ns;
+        void * h = android_dlopen_ext(name, RTLD_NOW | RTLD_LOCAL, &info);
+        if (h != nullptr) {
+            GGML_LOG_INFO("ggml-hex: loaded %s from %s namespace\n", name, ns_name);
+            return (dl_handle *) h;
+        }
+        GGML_LOG_ERROR("ggml-hex: %s namespace load failed: %s\n", ns_name, dlerror());
+    }
+    return nullptr;
+}
+#endif
+
 int htpdrv_init() {
     static dl_handle_ptr lib_cdsp_rpc_handle = nullptr;
     static bool initialized = false;
@@ -344,6 +451,12 @@ int htpdrv_init() {
 
     fs::path path{ drv_path.c_str() };
     dl_handle_ptr handle { dl_load_library(path) };
+#if defined(__ANDROID__)
+    if (!handle) {
+        GGML_LOG_INFO("ggml-hex: %s, retrying via vendor namespace\n", dl_error());
+        handle.reset(htp_load_vendor_library(drv_path.c_str()));
+    }
+#endif
     if (!handle) {
         GGML_LOG_ERROR("ggml-hex: failed to load %s: %s\n", path.u8string().c_str(), dl_error());
         return AEE_EUNABLETOLOAD;
